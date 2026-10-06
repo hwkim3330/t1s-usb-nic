@@ -15,6 +15,7 @@
 #include <esp_event.h>
 #include <esp_mac.h>
 #include <esp_timer.h>
+#include <rom/ets_sys.h>
 #include <driver/gpio.h>
 #include <driver/spi_master.h>
 #include "USB.h"
@@ -119,10 +120,17 @@ static void toUsbTask(void *) {
   Frame f;
   for (;;) {
     if (xQueueReceive(gToUsb, &f, portMAX_DELAY) != pdTRUE) continue;
-    // wait for a free IN buffer, but not forever: a host that stopped reading must not wedge us
-    int waited = 0;
-    while (!tud_network_can_xmit(f.len) && waited < 50) { vTaskDelay(1); waited++; }
-    if (waited < 50) {
+    // Wait for the IN buffer (the core builds TinyUSB with one NTB, so it is busy for the whole
+    // ~1.5 ms a full frame takes at USB full speed). Poll every 50 us, not every 1 ms tick: a
+    // tick per frame capped bus -> computer near 4 Mbit/s. The USB task runs at the top priority,
+    // so this loop cannot hold it off. A host that stopped reading costs at most 50 ms per frame.
+    const int64_t t0 = esp_timer_get_time();
+    bool ok;
+    while (!(ok = tud_network_can_xmit(f.len)) && esp_timer_get_time() - t0 < 50000) {
+      esp_rom_delay_us(50);
+      taskYIELD();
+    }
+    if (ok) {
       tud_network_xmit(f.buf, f.len);
       gT1sToUsb = gT1sToUsb + 1;
       gT1sToUsbBytes = gT1sToUsbBytes + f.len;

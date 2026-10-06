@@ -14,17 +14,22 @@ computer ──USB (CDC-NCM)── ESP32-S3 ──SPI 20 MHz── LAN8651 ═�
   **Wireshark on it is a live T1S capture**.
 - The same USB cable carries a **serial console** for PLCA and status.
 
-## Measured (2026-10-06, one board)
+## Measured (2026-10-06, one board, Linux)
+
+Bench: this adapter (PLCA coordinator, id 0 of 2) ═T1S═ a 100BASE-TX converter ─ an ESP32-S3 W5500
+node that sinks and blasts 1472 B UDP and reports what it saw.
 
 | check | result |
 |---|---|
-| Linux enumeration | `cdc_ncm` interface `enx…` appears, link follows the T1S link |
-| PLCA | coordinator (id 0 of 2), beacons seen |
-| ping across T1S + a 100BASE-TX converter to an ESP32 W5500 node | 10/10, avg 4.0 ms (min 3.2) |
-| live capture on the interface (`tshark -i enx…`) | bus traffic seen as it happens |
+| enumeration | `cdc_ncm` interface `enx…`, no driver; link follows the T1S link |
+| ping across T1S to the W5500 node | 10/10, avg 4.0 ms (min 3.2) |
+| live capture (`tshark -i enx…`) | bus traffic as it happens |
+| **computer → bus**, 1472 B | 4 / 6 / 8 Mbit/s offered: all delivered (8: 3392 of 3397); ceiling **8.4 Mbit/s** |
+| **bus → computer**, 1472 B | 4 / 6 Mbit/s: all delivered; 7 offered: 6.2; **above ≈6 Mbit/s the adapter drops** (counted as `t1s -> usb dropped`) and delivery falls to ≈4 |
 
-Not measured yet: throughput (expected ≈8 Mbit/s each way: USB full speed and the in-spec SPI
-clock both sit there), macOS/Windows.
+Bus → computer is the weaker direction: every frame must go out through the ESP32-S3's USB
+**full-speed** device, whose TinyUSB driver fills the FIFO from the CPU and, as built into the
+Arduino core, has one NCM IN buffer. Not tested: macOS, Windows.
 
 ## Build and flash
 
@@ -37,13 +42,24 @@ arduino-cli upload  --fqbn "$FQBN" -p /dev/ttyACM0 t1s_usb_nic
 ```
 
 The first flash from a board in "Hardware CDC and JTAG" firmware works over that port as usual.
-Afterwards the board shows up as a TinyUSB device (`303a:1001 ESP32S3_DEV`); if an upload cannot
-reset it, hold **BOOT** while plugging in.
+Afterwards the board is a TinyUSB device (`303a:1001 ESP32S3_DEV`) and a plain upload cannot reset
+it. Open its console at **1200 baud** and close it: it reboots into the ROM downloader (a
+`USB JTAG/serial debug unit` port). Flash with esptool, then reset with `--before usb-reset`
+(a plain hard reset leaves it in the downloader):
+
+```bash
+python3 -c "import serial,time; s=serial.Serial('/dev/ttyACM0',1200); time.sleep(0.2); s.close()"
+esptool --port /dev/ttyACM0 --before no-reset write-flash -z 0x10000 t1s_usb_nic.ino.bin
+esptool --port /dev/ttyACM0 --before usb-reset --after hard-reset chip-id
+```
+
+Holding **BOOT** while plugging in also enters the downloader.
 
 ## Use
 
 ```bash
 ip -br link | grep enx                          # the new interface
+sudo nmcli dev set enx… managed no              # else NetworkManager keeps trying DHCP and drops the address
 sudo ip addr add 192.168.100.10/24 dev enx…     # any address on the bus's subnet
 ping 192.168.100.66
 sudo wireshark -i enx…                          # live T1S bus
@@ -77,7 +93,8 @@ LED (IO38): solid = beacons seen (or link up with PLCA off), fast blink = no bea
 
 ## Limits
 
-- USB full speed (12 Mbit/s) and SPI 20 MHz: roughly 8 Mbit/s each way, below the 10 Mbit/s line rate.
+- Computer → bus up to ≈8.4 Mbit/s, bus → computer ≈6 Mbit/s (USB full speed, see above); the
+  T1S line rate is 10 Mbit/s.
 - PLCA is set from the console, not `ethtool`.
 - No hardware timestamps.
 
