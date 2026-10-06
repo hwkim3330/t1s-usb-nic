@@ -21,6 +21,7 @@
 #include "USB.h"
 #include "esp32-hal-tinyusb.h"
 #include "tusb.h"
+#include "src/ncm/t1s_net_device.h"
 #include "pins.h"
 #include "src/lan865x/esp_eth_mac_lan865x.h"
 #include "src/lan865x/esp_eth_phy_lan865x.h"
@@ -47,17 +48,21 @@ struct Frame { uint8_t *buf; uint16_t len; };
 static QueueHandle_t gToT1s = nullptr, gToUsb = nullptr;   // 32 frames each
 
 // ---------------------------------------------------------------- USB: CDC-NCM network function
-// TinyUSB's NCM class is compiled into the Arduino core (CONFIG_TINYUSB_NCM_ENABLED); it needs a
-// descriptor, a MAC address for the host side, and the three callbacks below.
+// The NCM class is our own copy of TinyUSB's (src/ncm/, renamed t1snet_/t1sncm_), built with three
+// transmit NTBs: the copy precompiled into the Arduino core has one, so every frame to the
+// computer waited for the previous USB transfer, which held bus -> computer near 6 Mbit/s.
+// The device stack asks usbd_app_driver_get_cb before its built-in drivers, so ours claims the
+// interface. It needs a descriptor, a MAC address for the host side, and the callbacks below.
+// (the hook itself is in src/ncm/t1s_ncm_hook.c)
 extern "C" {
-uint8_t tud_network_mac_address[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};   // set from efuse in setup()
+uint8_t t1snet_mac_address[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};   // set from efuse in setup()
 }
 
 static uint16_t ncmDescriptor(uint8_t *dst, uint8_t *itf) {
   static char macStr[13];
-  snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X", tud_network_mac_address[0],
-           tud_network_mac_address[1], tud_network_mac_address[2], tud_network_mac_address[3],
-           tud_network_mac_address[4], tud_network_mac_address[5]);
+  snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X", t1snet_mac_address[0],
+           t1snet_mac_address[1], t1snet_mac_address[2], t1snet_mac_address[3],
+           t1snet_mac_address[4], t1snet_mac_address[5]);
   const uint8_t strIdx = tinyusb_add_string_descriptor("10BASE-T1S (LAN8651)");
   const uint8_t macIdx = tinyusb_add_string_descriptor(macStr);
   const uint8_t epNotif = tinyusb_get_free_in_endpoint();
@@ -78,12 +83,12 @@ static struct NcmRegistration {
     esp_read_mac(m, ESP_MAC_ETH);
     m[0] = (m[0] | 0x02) & 0xFE;   // locally administered, unicast: the computer's side
     m[5] ^= 0x55;                  // and distinct from the LAN8651's own (efuse) address
-    memcpy(tud_network_mac_address, m, 6);
+    memcpy(t1snet_mac_address, m, 6);
     tinyusb_enable_interface(USB_INTERFACE_CUSTOM, TUD_CDC_NCM_DESC_LEN, ncmDescriptor);
   }
 } gNcmRegistration;
 
-extern "C" bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
+extern "C" bool t1snet_recv_cb(const uint8_t *src, uint16_t size) {
   // computer -> bus. Copied and handed to a task: the LAN8651 transmit takes SPI time that the
   // USB task should not spend.
   uint8_t *b = (uint8_t *)malloc(size);
@@ -93,16 +98,16 @@ extern "C" bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
     free(b);
     gUsbToT1sDrop = gUsbToT1sDrop + 1;
   }
-  tud_network_recv_renew();
+  t1snet_recv_renew();
   return true;
 }
 
-extern "C" uint16_t tud_network_xmit_cb(uint8_t *dst, void *ref, uint16_t arg) {
+extern "C" uint16_t t1snet_xmit_cb(uint8_t *dst, void *ref, uint16_t arg) {
   memcpy(dst, ref, arg);
   return arg;
 }
 
-extern "C" void tud_network_init_cb(void) {}
+extern "C" void t1snet_init_cb(void) {}
 
 static void toT1sTask(void *) {
   Frame f;
@@ -126,12 +131,12 @@ static void toUsbTask(void *) {
     // so this loop cannot hold it off. A host that stopped reading costs at most 50 ms per frame.
     const int64_t t0 = esp_timer_get_time();
     bool ok;
-    while (!(ok = tud_network_can_xmit(f.len)) && esp_timer_get_time() - t0 < 50000) {
+    while (!(ok = t1snet_can_xmit(f.len)) && esp_timer_get_time() - t0 < 50000) {
       esp_rom_delay_us(50);
       taskYIELD();
     }
     if (ok) {
-      tud_network_xmit(f.buf, f.len);
+      t1snet_xmit(f.buf, f.len);
       gT1sToUsb = gT1sToUsb + 1;
       gT1sToUsbBytes = gT1sToUsbBytes + f.len;
     } else gT1sToUsbDrop = gT1sToUsbDrop + 1;
@@ -154,7 +159,6 @@ static esp_err_t onT1sFrame(esp_eth_handle_t, uint8_t *buf, uint32_t len, void *
 static void onEthEvent(void *, esp_event_base_t, int32_t id, void *) {
   if (id != ETHERNET_EVENT_CONNECTED && id != ETHERNET_EVENT_DISCONNECTED) return;
   gLinkUp = id == ETHERNET_EVENT_CONNECTED;
-  tud_network_link_state(0, gLinkUp);
   Serial.printf("t1s: link %s\n", gLinkUp ? "up" : "down");
 }
 
@@ -252,8 +256,8 @@ static void status() {
   Serial.printf("t1s: link %s, SPI %.2f MHz\n", gLinkUp ? "up" : "down", gSpiMhz);
   if (gEth) printPlca();
   Serial.printf("usb: %s, host-side mac %02x:%02x:%02x:%02x:%02x:%02x\n", tud_ready() ? "configured" : "not configured",
-                tud_network_mac_address[0], tud_network_mac_address[1], tud_network_mac_address[2],
-                tud_network_mac_address[3], tud_network_mac_address[4], tud_network_mac_address[5]);
+                t1snet_mac_address[0], t1snet_mac_address[1], t1snet_mac_address[2],
+                t1snet_mac_address[3], t1snet_mac_address[4], t1snet_mac_address[5]);
   Serial.printf("usb -> t1s: %lu frames, %llu B, %lu dropped\n", (unsigned long)gUsbToT1s,
                 (unsigned long long)gUsbToT1sBytes, (unsigned long)gUsbToT1sDrop);
   Serial.printf("t1s -> usb: %lu frames, %llu B, %lu dropped\n", (unsigned long)gT1sToUsb,
