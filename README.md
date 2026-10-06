@@ -65,7 +65,7 @@ ping 192.168.100.66
 sudo wireshark -i enx…                          # live T1S bus
 ```
 
-Console (`/dev/ttyACM*`, any baud):
+Console (`/dev/ttyACM*`, any baud except 1200, which reboots it into the downloader):
 
 | command | |
 |---|---|
